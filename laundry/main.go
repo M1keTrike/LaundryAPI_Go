@@ -1,10 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"net/http"
+
 	"strconv"
 	"sync"
 	"time"
@@ -12,146 +12,189 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-type Washer struct {
-	name       string
-	waterLevel int
-	mu         sync.Mutex
+type LaundryOrder struct {
+	ID             int
+	LoadType       int
+	StartTime      time.Time
+	EndTime        time.Time
+	Priority       int
+	AssignedWasher string
+	Status         string
+}
+
+type LaundryServer struct {
+	orders     []*LaundryOrder
+	orderMutex sync.Mutex
+	orderID    int
+	washerURL  string
+	waitQueue  chan *LaundryOrder
 }
 
 const (
-	MaxWaterPerWasher = 80
-	WaterLoadType1    = 10
-	WaterLoadType2    = 20
-	WaterLoadType3    = 30
-	CycleDuration     = 3 * time.Second
-	TankServerSupply  = "http://localhost:4006/supply?quantity=" // URL del tanque para suministro
-	TankServerFill    = "http://localhost:4006/fill?quantity="   // URL del tanque para llenado
+	WasherServerURL = "http://localhost:4007/start"
+	MaxQueueSize    = 100
 )
 
-var washers = []*Washer{
-	{name: "washer1", waterLevel: MaxWaterPerWasher},
-	{name: "washer2", waterLevel: MaxWaterPerWasher},
-	{name: "washer3", waterLevel: MaxWaterPerWasher},
-}
-
-func (w *Washer) useWater(amount int) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.waterLevel < amount {
-		neededWater := amount - w.waterLevel
-		if err := requestWaterFromTank(neededWater, w); err != nil {
-			return err
-		}
+func NewLaundryServer() *LaundryServer {
+	return &LaundryServer{
+		orders:    []*LaundryOrder{},
+		washerURL: WasherServerURL,
+		waitQueue: make(chan *LaundryOrder, MaxQueueSize),
 	}
-
-	w.waterLevel -= amount
-	return nil
 }
 
-func requestWaterFromTank(amount int, w *Washer) error {
-	resp, err := http.Get(TankServerSupply + strconv.Itoa(amount))
+func (ls *LaundryServer) AddOrder(loadType int, priority int) *LaundryOrder {
+	ls.orderMutex.Lock()
+	defer ls.orderMutex.Unlock()
+
+	ls.orderID++
+	order := &LaundryOrder{
+		ID:       ls.orderID,
+		LoadType: loadType,
+		Priority: priority,
+		Status:   "Pendiente",
+	}
+	ls.orders = append(ls.orders, order)
+
+	// Agregar a la cola de espera para ser procesada
+	ls.waitQueue <- order
+	return order
+}
+
+func (ls *LaundryServer) processOrders() {
+	for order := range ls.waitQueue {
+		ls.assignOrderToWasher(order)
+	}
+}
+
+func (ls *LaundryServer) assignOrderToWasher(order *LaundryOrder) {
+	query := fmt.Sprintf("%s?load=%d", ls.washerURL, order.LoadType)
+	resp, err := http.Get(query)
 	if err != nil {
-		return fmt.Errorf("%s no pudo obtener agua del tanque: %v", w.name, err)
+		fmt.Printf("Error al enviar la orden ID %d al servidor de lavadoras: %v\n", order.ID, err)
+		order.Status = "Error"
+		return
 	}
 	defer resp.Body.Close()
 
-	reader := bufio.NewReader(resp.Body)
-	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if err.Error() == "EOF" {
-				break
+	if resp.StatusCode == http.StatusOK {
+		order.StartTime = time.Now()
+		order.Status = "En Proceso"
+
+		done := make(chan string)
+		go func() {
+			defer close(done)
+
+			var response map[string]interface{}
+			if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+				done <- fmt.Sprintf("Error al completar la orden ID %d: %v", order.ID, err)
+				return
 			}
-			return fmt.Errorf("%s encontró un error al leer el agua: %v", w.name, err)
-		}
 
-		var payload map[string]int
-		if err := json.Unmarshal(line, &payload); err != nil {
-			return fmt.Errorf("%s no pudo procesar el bloque de agua: %v", w.name, err)
-		}
+			message, ok := response["message"].(string)
+			if !ok {
+				done <- fmt.Sprintf("Respuesta inesperada del servidor de lavadoras para la orden ID %d", order.ID)
+				return
+			}
 
-		waterReceived := payload["water"]
-		w.mu.Lock()
-		w.waterLevel += waterReceived
-		w.mu.Unlock()
-		fmt.Printf("%s recibió %d unidades de agua. Nivel actual: %d\n", w.name, waterReceived, w.waterLevel)
+			done <- message
+		}()
+
+		// Esperar la confirmación de finalización
+		message := <-done
+		order.EndTime = time.Now()
+		order.Status = "Completado"
+		order.AssignedWasher = "Lavadora asignada"
+		fmt.Printf("Orden ID %d finalizada con éxito. Mensaje: %s\n", order.ID, message)
+	} else {
+		fmt.Printf("No se pudo asignar la orden ID %d, reintentando más tarde.\n", order.ID)
+		order.Status = "Pendiente"
+		ls.waitQueue <- order // Reagregar a la cola si falla
 	}
-
-	if resp.StatusCode == http.StatusConflict {
-		fmt.Println("El tanque está vacío, llenándolo hasta la mitad...")
-		_, fillErr := http.Post(TankServerFill+"75", "application/json", nil)
-		if fillErr != nil {
-			return fmt.Errorf("Error llenando el tanque: %v", fillErr)
-		}
-		time.Sleep(2 * time.Second) // Esperar un momento para que el tanque se recargue
-	}
-
-	return nil
 }
 
-func startWashing(loadType int, washer *Washer) {
-	var waterNeeded int
+func (ls *LaundryServer) GetOrders() []*LaundryOrder {
+	ls.orderMutex.Lock()
+	defer ls.orderMutex.Unlock()
+	return ls.orders
+}
 
-	switch loadType {
-	case 1:
-		waterNeeded = WaterLoadType1
-	case 2:
-		waterNeeded = WaterLoadType2
-	case 3:
-		waterNeeded = WaterLoadType3
-	default:
-		fmt.Printf("%s recibió una carga inválida\n", washer.name)
-		return
+func (ls *LaundryServer) GetOrderByID(id int) (*LaundryOrder, bool) {
+	ls.orderMutex.Lock()
+	defer ls.orderMutex.Unlock()
+
+	for _, order := range ls.orders {
+		if order.ID == id {
+			return order, true
+		}
 	}
-
-	if err := washer.useWater(waterNeeded); err != nil {
-		fmt.Printf("Error en %s: %v\n", washer.name, err)
-		return
-	}
-
-	fmt.Printf("%s comenzó el ciclo de lavado con carga tipo %d\n", washer.name, loadType)
-	time.Sleep(CycleDuration)
-	fmt.Printf("%s terminó el ciclo de lavado\n", washer.name)
+	return nil, false
 }
 
 func main() {
+	laundryServer := NewLaundryServer()
+
+	// Iniciar procesamiento de órdenes en la cola
+	go laundryServer.processOrders()
+
 	r := gin.Default()
 
-	r.GET("/start", func(c *gin.Context) {
-		loadTypeStr := c.Query("load")
-		if loadTypeStr == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "El parámetro 'load' es requerido"})
+	// Endpoint para crear una nueva orden
+	r.POST("/order", func(c *gin.Context) {
+		loadTypeStr := c.Query("loadType")
+		priorityStr := c.Query("priority")
+		if loadTypeStr == "" || priorityStr == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Los parámetros 'loadType' y 'priority' son requeridos"})
 			return
 		}
 
-		loadType, err := strconv.Atoi(loadTypeStr)
-		if err != nil || loadType < 1 || loadType > 3 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "El parámetro 'load' debe ser 1, 2 o 3"})
+		loadType, err1 := strconv.Atoi(loadTypeStr)
+		priority, err2 := strconv.Atoi(priorityStr)
+		if err1 != nil || err2 != nil || loadType < 1 || loadType > 3 || priority < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Parámetros inválidos"})
 			return
 		}
 
-		// Asignar lavadora disponible
-		var selectedWasher *Washer
-		for _, washer := range washers {
-			if washer != nil {
-				selectedWasher = washer
-				break
-			}
-		}
+		order := laundryServer.AddOrder(loadType, priority)
 
-		if selectedWasher == nil {
-			c.JSON(http.StatusConflict, gin.H{"error": "No hay lavadoras disponibles"})
-			return
-		}
-
-		go startWashing(loadType, selectedWasher)
+		// Esperar a que la orden sea procesada
+		message := make(chan string)
+		go func() {
+			<-message // Bloquear hasta que la orden termine
+		}()
 
 		c.JSON(http.StatusOK, gin.H{
-			"message": fmt.Sprintf("%s comenzó el ciclo de lavado", selectedWasher.name),
+			"message": fmt.Sprintf("Orden ID %d en cola", order.ID),
+			"details": gin.H{
+				"order_id": order.ID,
+				"status":   order.Status,
+			},
 		})
 	})
 
-	// Ejecutar el servidor en el puerto 4007
-	r.Run(":4007")
+	// Endpoint para listar todas las órdenes
+	r.GET("/orders", func(c *gin.Context) {
+		orders := laundryServer.GetOrders()
+		c.JSON(http.StatusOK, orders)
+	})
+
+	// Endpoint para obtener una orden específica
+	r.GET("/order/:id", func(c *gin.Context) {
+		idStr := c.Param("id")
+		id, err := strconv.Atoi(idStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "ID inválido"})
+			return
+		}
+
+		order, found := laundryServer.GetOrderByID(id)
+		if !found {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Orden no encontrada"})
+			return
+		}
+
+		c.JSON(http.StatusOK, order)
+	})
+
+	r.Run(":4010")
 }
